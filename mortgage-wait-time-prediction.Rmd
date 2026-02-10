@@ -1,0 +1,348 @@
+---
+title: "Part 3 final DM"
+output: html_document
+date: "2025-04-03"
+---
+
+Note: Some packages display warnings about being built under R version 4.4.3, while my current environment uses an earlier version. These warnings are non-critical and do not affect the execution or output of the code. All functionality has been tested and works as expected.
+
+#Part III: Supervised Learning – Predicting Wait Time Between Loan Approval and Advance
+
+Predicting mortgage approval-to-disbursement wait times provides value to lenders (resource planning) and applicants (reduced uncertainty). This analysis uses a dataset of historical mortgage applications and explores two modeling strategies to predict the wait time (in days) between approval and disbursement:
+•	Strategy A: A full-model approach using the complete dataset with appropriate feature imputation.
+•	Strategy B: A segmented approach that trains separate models for joint and single applicants.
+
+
+#EDA & Preprocessing:
+
+```{r }
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(randomForest)
+library(MASS) 
+library(rstanarm)
+library(ggplot2)
+
+df3 <- read.csv("dataset_3.csv")
+
+glimpse(df3)
+
+df3 <- df3 %>%
+  mutate(
+    approval_date = ymd(Approval_Date),
+    advance_date = ymd(Advance_Date),
+    wait_time_days = as.numeric(difftime(advance_date, approval_date, units = "days"))
+  ) %>%
+  filter(!is.na(wait_time_days), wait_time_days >= 0)
+
+summary(df3$wait_time_days)
+```
+
+The dataset contained 12,535 rows with 17 variables including applicant attributes (age, income, gender), loan details (amount, valuation, property type), location metadata, and wait time (days between approval and advance).
+
+
+#Data Cleaning and Imputation (Strategy A)
+
+```{r }
+df_model <- df3 %>% dplyr :: select(-X, -Approval_Date, -Advance_Date)
+
+num_vars <- c("App2_Age", "App2_Income", "Property_Age")
+for (col in num_vars) {
+  df_model[[col]][is.na(df_model[[col]])] <- mean(df_model[[col]], na.rm = TRUE)
+}
+
+categorical_impute <- function(x) {
+  ux <- na.omit(unique(x))
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+cat_vars <- c("App2_G", "Area", "Country", "Origin", "Joint", "Property_Type")
+for (col in cat_vars) {
+  df_model[[col]][is.na(df_model[[col]])] <- categorical_impute(df_model[[col]])
+}
+
+df_model <- df_model %>%
+  mutate(
+    Country = factor(Country),
+    Origin = factor(Origin),
+    Joint = factor(Joint),
+    Property_Type = factor(Property_Type),
+    Area = factor(Area),
+    App1_G = factor(App1_G),
+    App2_G = factor(App2_G)
+  )
+
+glimpse(df_model)
+```
+
+We begin our analysis by loading the dataset and inspecting its structure. The key objective is to model the wait time (in days), which is calculated as the difference between the advance_date and approval_date. To do this, we first convert both date columns into proper Date objects and then compute the new variable wait_time_days. After removing records with missing advance_date, 3,429 complete observations remained.
+
+Preprocessing issues included negative wait times and missing values in Country, Area, Property_Age, and App2_*. Categorical variables (e.g., Country, Origin, Joint, Property_Type, Area) were converted to factors. Numeric variables (App2_Age, App2_Income, Property_Age) were imputed using means; categorical variables used modes before factor conversion.
+
+#Target variable distribution 
+```{r}
+p1 <- ggplot(df_model, aes(x= wait_time_days)) + 
+  geom_histogram(bins=50, fill="steelblue") +
+  labs(title="Wait Time Distribution", x="Days", y="Count") +
+  theme_minimal()
+print(p1)
+```
+
+Wait time distribution was right-skewed (most 10-30 days, with long tail beyond 80 days), suggesting typical quick processing with occasional delays. This pattern supported using flexible models like Random Forests and Bayesian regression.
+
+#Strategy A: Full Model (Linear, Random Forest, Bayesian)
+
+#Linear Regression
+```{r }
+set.seed(123)
+
+# Remove unnecessary date columns
+df_lm <- df_model %>%
+  dplyr::select(-approval_date, -advance_date)
+
+# Split the data (80% train, 20% test)
+train_indices <- sample(1:nrow(df_lm), 0.8 * nrow(df_lm))
+train_lm <- df_lm[train_indices, ]
+test_lm  <- df_lm[-train_indices, ]
+
+model_lm <- lm(wait_time_days ~ ., data = train_lm)
+
+# Predict on test data
+pred_lm <- predict(model_lm, newdata = test_lm)
+
+actual <- test_lm$wait_time_days
+lm_rmse <- sqrt(mean((pred_lm - actual)^2))       # Root Mean Squared Error
+lm_mae  <- mean(abs(pred_lm - actual))            # Mean Absolute Error
+lm_r2   <- cor(pred_lm, actual)^2                 # R-squared on test data
+
+
+cat("Linear Regression — RMSE:", round(lm_rmse, 2),
+    " MAE:", round(lm_mae, 2),
+    " R²:", round(lm_r2, 3), "\n")
+```
+
+The data was split 80/20 for training and testing. Predictions on the test set were evaluated using RMSE, MAE, and R².
+
+The linear regression model showed moderate performance, with an average error (MAE) of 9.26 days, RMSE of 12.01 days, and R² of 0.268—explaining about 27% of variance. While somewhat informative, the high errors and low R² suggest the model struggles with data complexity, indicating potential gains from using more advanced methods like Random Forest or Bayesian regression.
+
+
+Random forests
+
+```{r }
+set.seed(123)
+train_index <- createDataPartition(df_lm$wait_time_days, p = 0.8, list = FALSE)
+train <- df_lm[train_index, ]
+test <- df_lm[-train_index, ]
+
+model_rf <- randomForest(wait_time_days ~ ., data = train, ntree = 500)
+pred_rf <- predict(model_rf, test)
+
+rf_rmse <- sqrt(mean((pred_rf - test$wait_time_days)^2))
+rf_mae  <- mean(abs(pred_rf - test$wait_time_days))
+rf_r2   <- cor(pred_rf, test$wait_time_days)^2
+
+cat("Random Forest — RMSE:", round(rf_rmse, 2),
+    " MAE:", round(rf_mae, 2),
+    " R²:", round(rf_r2, 3), "\n")
+varImpPlot(model_rf, main = "Variable Importance – Random Forest (Full Model)")
+```
+
+The dataset is split into training (80%) and test (20%) sets using stratified sampling for better balance. A Random Forest with 500 trees is trained, and model performance is evaluated using RMSE, MAE, and R².
+
+These results suggest that, on average, the model's predictions are off by about 8 to 11 days, which is a moderate level of error depending on the business context. The R² value of 0.35 indicates that the model explains 35% of the variance in the time between mortgage approval and advancement.
+
+The variable importance plot shows key drivers of mortgage wait time. Loan amount ranks highest, indicating larger or more complex loans may take longer to process. Property age and valuation suggest property characteristics play a key role, potentially due to inspection, legal checks, or documentation delays. App1_Income also features prominently, possibly reflecting how financial strength affects underwriting or approval confidence.
+
+#Bayesian regression
+
+```{r }
+model_bayes <- stan_glm(wait_time_days ~ ., data = train, family = gaussian(), refresh = 0)
+pred_bayes <- predict(model_bayes, newdata = test)
+
+bayes_rmse <- sqrt(mean((pred_bayes - test$wait_time_days)^2))
+bayes_mae  <- mean(abs(pred_bayes - test$wait_time_days))
+bayes_r2   <- cor(pred_bayes, test$wait_time_days)^2
+
+cat("Bayesian Regression — RMSE:", round(bayes_rmse, 2),
+    " MAE:", round(bayes_mae, 2),
+    " R²:", round(bayes_r2, 3), "\n")
+```
+
+A Bayesian linear regression model was trained using a Gaussian error distribution. The Bayesian approach also captures uncertainty in predictions, adding interpretive value.
+
+The model outperforms linear regression but falls slightly short of Random Forest. With an 8.77-day average error and explaining 31.3% of variance, it captures underlying patterns more effectively than linear approaches. As a Bayesian method, it provides valuable probabilistic outputs and uncertainty estimates for risk-aware decision-making, offering a good balance between interpretability and performance.
+
+#Results Summary strategy A
+
+```{r }
+strategy_a <- tibble(
+  Model = c("Linear Regression", "Random Forest", "Bayesian Regression"),
+  RMSE = c(lm_rmse, rf_rmse, bayes_rmse),
+  MAE = c(lm_mae, rf_mae, bayes_mae),
+  R2 = c(lm_r2, rf_r2, bayes_r2)
+)
+
+knitr::kable(strategy_a, caption = "Strategy A: Full Model Performance")
+```
+
+Random Forest performed best (lowest RMSE: 10.61, highest R²: 0.35), capturing more wait time variance than other models. Linear and Bayesian regression showed similar error metrics, suggesting linear relationships explain a reasonable portion of data variation. Key predictors from Random Forest were Loan amount, Valuation, Property Age, and Applicant 1's Income, highlighting the importance of both financial and property-related factors in processing time determination.
+
+#predicted vs actual graph
+
+```{r}
+results_df <- tibble(Actual = test$wait_time_days, Predicted = pred_rf)
+
+ggplot(results_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Predicted vs Actual – Random Forest (Strategy A)")
+```
+
+The Random Forest model shows tight clustering around the ideal line, especially between 10–40 days, effectively capturing non-linear patterns with less underestimation at higher wait times. While some dispersion remains in extreme values, its strong alignment with actual values and superior metrics (R² = 0.35, RMSE = 10.61) confirm it as the best-performing full model.
+
+Limitations
+•	App2-related features were often missing and filled via imputation, which introduces uncertainty.
+•	Ignores structural differences between joint and single applicants
+--------------------------------------------------------------------------------
+#Strategy B: Split by Applicant Type (Joint vs Single)
+
+Motivation:
+The dataset segmentation by applicant type addresses structural differences between joint and single applications. Joint applications contain additional features for the second applicant (App2_Age, App2_G, App2_Income) that don't apply to single applicants. Including these variables in one unified model would introduce irrelevant feature noise and reduce predictive accuracy. This led to creating two separate models: a Single Applicants model (excluding all App2 variables) and a Joint Applicants model (retaining these variables).
+
+```{r }
+df_model$Joint <- as.factor(df_model$Joint)
+
+single_applicants <- df_model %>% filter(Joint == "0")
+joint_applicants  <- df_model %>% filter(Joint == "1")
+```
+
+Converts the Joint column into a factor (to use "0" and "1" as levels).
+
+The data is split into two groups: single applicants, where `Joint == 0` indicating they are applying alone, and joint applicants, where `Joint == 1` indicating they are applying with a second applicant.
+
+#Prepare Feature Sets
+```{r}
+# For single applicants 
+df_single <- single_applicants %>%
+  dplyr :: select(-any_of(c("App2_Age", "App2_G", "App2_Income", "X", "approval_date", "advance_date"))) %>%
+  droplevels()
+
+# For joint applicants
+df_joint <- joint_applicants %>%
+  dplyr :: select(-any_of(c("X", "approval_date", "advance_date"))) %>%
+  droplevels()
+```
+
+•	Single Applicants Model: Excludes all App2 variables
+•	Joint Applicants Model: Includes App2 variables
+
+#Modeling Function
+
+
+```{r }
+run_model_eval <- function(df, model_type = "rf") {
+  set.seed(123)
+  index <- createDataPartition(df$wait_time_days, p = 0.8, list = FALSE)
+  train <- df[index, ] %>% droplevels()
+  test  <- df[-index, ] %>% droplevels()
+
+  if (model_type == "rf") {
+    model <- randomForest(wait_time_days ~ ., data = train, ntree = 500, importance = TRUE)
+    pred <- predict(model, test)
+  } else {
+    stop("Unsupported model type")
+  }
+
+  rmse <- sqrt(mean((pred - test$wait_time_days)^2))
+  mae  <- mean(abs(pred - test$wait_time_days))
+  r2   <- cor(pred, test$wait_time_days)^2
+
+  list(model = model, RMSE = rmse, MAE = mae, R2 = r2, test_data = test)
+}
+```
+
+Both models were trained using Random Forest to ensure consistency in evaluation and comparison.Each subset is used to train a dedicated Random Forest model using an 80/20 train-test split. A helper function run_model_eval is used to train the model, generate predictions, and calculate performance metrics (RMSE, MAE, R²).
+#Run for both segments
+
+
+```{r}
+metrics_single <- run_model_eval(df_single)
+metrics_joint  <- run_model_eval(df_joint)
+
+varImpPlot(metrics_single$model, main = "Variable Importance – Single Applicants")
+varImpPlot(metrics_joint$model, main = "Variable Importance – Joint Applicants")
+```
+
+The results were stored in metrics_single and metrics_joint, respectively. This segmentation allows for a more tailored modeling approach, enabling a clearer comparison of how predictive performance varies across applicant types.
+
+For single applicants, top predictors in the segmented Random Forest models were Loan amount, Property Age, and Valuation based on both %IncMSE and Node Purity, showing property characteristics and loan size drive wait times. App1_Income ranked highly in %IncMSE while App1_Age featured prominently in Node Purity ranking, indicating different applicant financial profile aspects affect processing time.
+
+For joint applicants, both metrics highlighted Loan amount, App1_Income, Valuation, and Property Age as key predictors. The prominence of income-related features across both segments underscores the impact of financial capacity on wait time. Overall, results confirm that financial and property factors are central, with slight variations depending on applicant type.
+
+
+```{r}
+strategy_b <- tibble(
+  Segment = c("Single Applicants", "Joint Applicants"),
+  RMSE = c(metrics_single$RMSE, metrics_joint$RMSE),
+  MAE = c(metrics_single$MAE, metrics_joint$MAE),
+  R2 = c(metrics_single$R2, metrics_joint$R2)
+)
+
+knitr::kable(strategy_b, caption = "Strategy B: Segmented Random Forest Models")
+```
+
+The Joint Applicants Model outperformed the unified model in terms of R²(0.400 vs 0.350). These results suggest that segmenting by applicant type provides value, particularly for joint applications, where the additional features related to the second applicant enhance predictive power. Although the model for single applicants had slightly lower error possibly due to lower data complexity, the joint applicant model captured more variance in the outcome, indicating that segmentation supports more tailored and effective predictive modeling.
+
+
+
+#Predicted vs Actual plot
+```{r}
+plot_predicted_vs_actual <- function(model, test_data, segment_name) {
+  pred <- predict(model, newdata = test_data)
+  actual <- test_data$wait_time_days
+
+  ggplot(data.frame(actual, pred), aes(x = actual, y = pred)) +
+    geom_point(alpha = 0.6, color = "darkblue") +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    labs(
+      title = paste("Predicted vs Actual —", segment_name),
+      x = "Actual Wait Time (days)",
+      y = "Predicted Wait Time (days)"
+    ) +
+    theme_minimal()
+}
+
+plot_predicted_vs_actual(metrics_single$model, metrics_single$test_data, "Single Applicants")
+plot_predicted_vs_actual(metrics_joint$model, metrics_joint$test_data, "Joint Applicants")
+```
+
+The predicted vs actual plot for single applicants shows strong performance in the 0–30 day range, with points closely aligned to the ideal line. However, the model underestimates delays beyond 40 days, likely due to limited features (no App2 data) and fewer extreme-case samples, making it harder to capture longer wait times accurately.
+
+The joint applicants plot shows tighter alignment with the ideal line across all wait times, including 40–70 days. Variance is lower, and predictions remain consistent, supporting the higher R² (0.40). The model benefits from a richer feature set (e.g., combined income, dual age, property factors), enabling better explanation of delay patterns and reduced bias.
+
+
+#Recommendation
+Based on performance and domain logic, I recommend adopting:
+Strategy B (Segmented Modeling) for production.
+•	It avoids forcing App2-related features into irrelevant cases.
+•	It yields higher R² for joint applicants, who likely represent more financially significant applications.
+•	Its design better reflects business rules and real-world complexity.
+
+
+#Limitations:
+•	The models cannot account for external economic factors or policy changes that might influence processing times.
+•	Internal workflow or staffing variables were likely not captured in the dataset but may significantly impact wait times.
+
+
+#Future Work:
+•	Integrate time series elements to factor in approval date trends (e.g., seasonal effects)
+•	Include 3rd-party adviser turnaround times or process flags
+•	Use XGBoost or gradient boosting to further improve accuracy
+•	Introduce calibration windows based on average processing delays by source channel
+
+
+#Conclusion
+By comparing a full-model strategy (Strategy A) with a segmented modeling strategy (Strategy B), we showed that contextual segmentation improves predictive accuracy, particularly when modeling behaviorally and structurally distinct groups (single vs joint applicants).
+The best-performing model was the Random Forest in Strategy B (Joint applicants) with an R² of 0.40, while the unified model in Strategy A yielded a maximum R² of 0.35.
+These results suggest that data segmentation by applicant type is not only reasonable but beneficial. In practical deployment, a hybrid approach using a routing logic (based on joint/single status) could deliver optimal predictions while maintaining model simplicity for each segment.
